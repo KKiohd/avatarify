@@ -2,7 +2,7 @@ from scipy.spatial import ConvexHull
 import torch
 import yaml
 from modules.keypoint_detector import KPDetector
-from modules.generator_optim import OcclusionAwareGenerator
+from modules.generator import OcclusionAwareGenerator
 from sync_batchnorm import DataParallelWithCallback
 import numpy as np
 import face_alignment
