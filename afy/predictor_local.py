@@ -2,7 +2,7 @@ from scipy.spatial import ConvexHull
 import torch
 import yaml
 from modules.keypoint_detector import KPDetector
-from modules.generator_optim import OcclusionAwareGenerator
+from modules.generator import OcclusionAwareGenerator
 from sync_batchnorm import DataParallelWithCallback
 import numpy as np
 import face_alignment
@@ -31,7 +31,7 @@ class PredictorLocal:
 
     def load_checkpoints(self):
         with open(self.config_path) as f:
-            config = yaml.load(f)
+            config = yaml.safe_load(f)
     
         generator = OcclusionAwareGenerator(**config['model_params']['generator_params'],
                                             **config['model_params']['common_params'])
@@ -63,7 +63,7 @@ class PredictorLocal:
         else:
             source_enc = self.source
 
-        self.generator.encode_source(source_enc)
+        self.generator.source_enc = (source_enc)
 
     def predict(self, driving_frame):
         assert self.kp_source is not None, "call set_source_image()"
