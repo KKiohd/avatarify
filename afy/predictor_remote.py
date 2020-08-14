@@ -1,202 +1,134 @@
+Skip to content
+Search or jump to…
+
+Pull requests
+Issues
+Marketplace
+Explore
+ 
+@KKiohd 
+Learn Git and GitHub without any code!
+Using the Hello World guide, you’ll start a branch, write comments, and open a pull request.
+
+
+mynameisfiber
+/
+avatarify
+forked from alievk/avatarify
+0
+01.2k
+Code
+Pull requests
+Actions
+Projects
+Wiki
+Security
+Insights
+avatarify/predictor_remote.py /
+@mynameisfiber
+mynameisfiber reduce communications overhead and add compression flag
+Latest commit 69dac33 on 19 Apr
+ History
+ 1 contributor
+88 lines (71 sloc)  2.5 KB
+  
+from predictor_local import PredictorLocal
 from arguments import opt
-from networking import SerializingContext, check_connection
-from utils import Logger, TicToc, AccumDict, Once
 
-import multiprocessing as mp
-import queue
-
-import cv2
-import numpy as np
 import zmq
+import blosc
 import msgpack
 import msgpack_numpy as m
 m.patch()
 
 
-PUT_TIMEOUT = 0.1 # s
-GET_TIMEOUT = 0.1 # s
-RECV_TIMEOUT = 1000 # ms
-QUEUE_SIZE = 100
+DEFAULT_PORT = 5556
+
+
+if opt.compress:
+    def pack_message(msg):
+        return blosc.compress(msgpack.packb(msg), typesize=8)
+    
+    def unpack_message(msg):
+        return msgpack.unpackb(blosc.decompress(msg))
+else:
+    def pack_message(msg):
+        return msgpack.packb(msg)
+    
+    def unpack_message(msg):
+        return msgpack.unpackb(msg)
 
 
 class PredictorRemote:
-    def __init__(self, *args, in_addr=None, out_addr=None, **kwargs):
-        self.in_addr = in_addr
-        self.out_addr = out_addr
+    def __init__(self, *args, worker_host='localhost', worker_port=DEFAULT_PORT, **kwargs):
+        self.worker_host = worker_host
+        self.worker_port = worker_port
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PAIR)
+        self.socket.connect(f"tcp://{worker_host}:{worker_port}")
+        print(f"Connected to {worker_host}:{worker_port}")
         self.predictor_args = (args, kwargs)
-        self.timing = AccumDict()
-        self.log = Logger('./var/log/predictor_remote.log', verbose=opt.verbose)
+        self.init_worker()
 
-        self.send_queue = mp.Queue(QUEUE_SIZE)
-        self.recv_queue = mp.Queue(QUEUE_SIZE)
+    def init_worker(self):
+        msg = (
+            '__init__',
+            *self.predictor_args,
+        )
+        return self._send_recv_msg(msg)
 
-        self.worker_alive = mp.Value('i', 0)
+    def __getattr__(self, item):
+        return lambda *args, **kwargs: self._send_recv_msg((item, args, kwargs))
 
-        self.send_process = mp.Process(
-            target=self.send_worker, 
-            args=(self.in_addr, self.send_queue, self.worker_alive),
-            name="send_process"
-            )
-        self.recv_process = mp.Process(
-            target=self.recv_worker, 
-            args=(self.out_addr, self.recv_queue, self.worker_alive),
-            name="recv_process"
-            )
+    def _send_recv_msg(self, msg):
+        self.socket.send(pack_message(msg), copy=False)
+        response = self.socket.recv()
+        return unpack_message(response)
 
-        self._i_msg = -1
 
-    def start(self):
-        self.worker_alive.value = 1
-        self.send_process.start()
-        self.recv_process.start()
+def message_handler(port):
+    print("Creating socket")
+    context = zmq.Context()
+    socket = context.socket(zmq.PAIR)
+    socket.bind("tcp://*:%s" % port)
+    predictor = None
+    predictor_args = ()
 
-        self.init_remote_worker()
-
-    def stop(self):
-        self.worker_alive.value = 0
-        self.log("join worker processes...")
-        self.send_process.join(timeout=5)
-        self.recv_process.join(timeout=5)
-        self.send_process.terminate()
-        self.recv_process.terminate()
-
-    def init_remote_worker(self):
-        return self._send_recv_async('__init__', self.predictor_args, critical=True)
-
-    def __getattr__(self, attr):
-        is_critical = attr != 'predict'
-        return lambda *args, **kwargs: self._send_recv_async(attr, (args, kwargs), critical=is_critical)
-
-    def _send_recv_async(self, method, args, critical):
-        self._i_msg += 1
-
-        args, kwargs = args
-
-        tt = TicToc()
-        tt.tic()
-        if method == 'predict':
-            image = args[0]
-            assert isinstance(image, np.ndarray), 'Expected image'
-            ret_code, data = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), opt.jpg_quality])
-        else:
-            data = msgpack.packb((args, kwargs))
-        self.timing.add('PACK', tt.toc())
-
-        meta = {
-            'name': method,
-            'critical': critical,
-            'id': self._i_msg
-        }
-
-        self.log("send", meta)
-
-        if critical:
-            self.send_queue.put((meta, data))
-
-            while True:
-                meta_recv, data_recv = self.recv_queue.get()
-                if meta_recv == meta:
-                    break
-        else:
-            try:
-                # TODO: find good timeout
-                self.send_queue.put((meta, data), timeout=PUT_TIMEOUT)
-            except queue.Full:
-                self.log('send_queue is full')
-
-            try:
-                meta_recv, data_recv = self.recv_queue.get(timeout=GET_TIMEOUT)
-            except queue.Empty:
-                self.log('recv_queue is empty')
-                return None
-
-        self.log("recv", meta_recv)
-
-        tt.tic()
-        if meta_recv['name'] == 'predict':
-            result = cv2.imdecode(np.frombuffer(data_recv, dtype='uint8'), -1)
-        else:
-            result = msgpack.unpackb(data_recv)
-        self.timing.add('UNPACK', tt.toc())
-
-        if opt.verbose:
-            Once(self.timing, per=1)
-
-        return result
-
-    @staticmethod
-    def send_worker(address, send_queue, worker_alive):
-        timing = AccumDict()
-        log = Logger('./var/log/send_worker.log', opt.verbose)
-
-        ctx = SerializingContext()
-        sender = ctx.socket(zmq.PUSH)
-        sender.connect(address)
-
-        log(f"Sending to {address}")
-
+    print("Listening for messages on port:", port)
+    while True:
+        msg_raw = socket.recv()
         try:
-            while worker_alive.value:
-                tt = TicToc()
+            msg = unpack_message(msg_raw)
+        except ValueError:
+            print("Invalid Message")
+            continue
+        method = msg[0]
+        if method == "__init__":
+            predictor_args_new = msg[1:]
+            if predictor_args_new == predictor_args:
+                print("Same config as before... reusing previous predictor")
+            else:
+                del predictor
+                predictor_args = predictor_args_new
+                predictor = PredictorLocal(*predictor_args[0], **predictor_args[1])
+                print("Initialized predictor with:", predictor_args)
+            result = True
+        else:
+            result = getattr(predictor, method)(*msg[1], **msg[2])
+        socket.send(pack_message(result), copy=False)
 
-                try:
-                    msg = send_queue.get(timeout=GET_TIMEOUT)
-                except queue.Empty:
-                    continue
 
-                tt.tic()
-                sender.send_data(*msg)
-                timing.add('SEND', tt.toc())
-
-                if opt.verbose:
-                    Once(timing, log, per=1)
-        except KeyboardInterrupt:
-            log("send_worker: user interrupt")
-        finally:
-            worker_alive.value = 0
-
-        sender.disconnect(address)
-        sender.close()
-        ctx.destroy()
-        log("send_worker exit")
-
-    @staticmethod
-    def recv_worker(address, recv_queue, worker_alive):
-        timing = AccumDict()
-        log = Logger('./var/log/recv_worker.log')
-
-        ctx = SerializingContext()
-        receiver = ctx.socket(zmq.PULL)
-        receiver.connect(address)
-        receiver.RCVTIMEO = RECV_TIMEOUT
-
-        log(f"Receiving from {address}")
-
-        try:
-            while worker_alive.value:
-                tt = TicToc()
-
-                try:
-                    tt.tic()
-                    msg = receiver.recv_data()
-                    timing.add('RECV', tt.toc())
-                except zmq.error.Again:
-                    continue
-                
-                try:
-                    recv_queue.put(msg, timeout=PUT_TIMEOUT)
-                except queue.Full:
-                    log('recv_queue full')
-                    continue
-
-                if opt.verbose:
-                    Once(timing, log, per=1)
-        except KeyboardInterrupt:
-            log("recv_worker: user interrupt")
-        finally:
-            worker_alive.value = 0
-
-        receiver.disconnect(address)
-        receiver.close()
-        ctx.destroy()
-        log("recv_worker exit")
+def run_worker(port):
+    message_handler(port)
+© 2020 GitHub, Inc.
+Terms
+Privacy
+Security
+Status
+Help
+Contact GitHub
+Pricing
+API
+Training
+Blog
+About
